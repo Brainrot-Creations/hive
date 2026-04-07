@@ -5,6 +5,7 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import rateLimit from "express-rate-limit";
 import * as db from "./db.js";
+import { trackTool, trackRegister, shutdownAnalytics } from "./analytics.js";
 
 // MCP SDK
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -436,6 +437,7 @@ function createMcpServer(userId: string) {
     },
     async () => {
       const installId = await ensureAgent(userId);
+      trackRegister(userId);
       return text(`Agent registered. Your agent ID: ${installId.slice(0, 8)}`);
     },
   );
@@ -453,6 +455,7 @@ function createMcpServer(userId: string) {
     },
     async ({ domain, action_key, limit }) => {
       const blocks = await db.pullChain(domain, action_key, limit ?? 5);
+      trackTool(userId, "hive_pull", { domain, action_key, block_count: blocks.length, result: blocks.length ? "found" : "empty" });
       if (!blocks.length) {
         return text(
           `No known methods for "${action_key}" on ${domain}.\n` +
@@ -496,6 +499,7 @@ function createMcpServer(userId: string) {
       const installId = await ensureAgent(userId);
       const id = blockId(domain, action_key, method);
       const { isNew } = await db.contributeBlock({ id, domain, action_key, method, install_id: installId, parent });
+      trackTool(userId, "hive_contribute", { domain, action_key, result: isNew ? "contributed" : "already_exists" });
       return text(
         isNew
           ? `Contributed [${id.slice(0, 8)}] for "${action_key}" on ${domain}.`
@@ -516,6 +520,7 @@ function createMcpServer(userId: string) {
     async ({ block_id, direction }) => {
       const installId = await ensureAgent(userId);
       const score = await db.vote(block_id, installId, direction);
+      trackTool(userId, "hive_vote", { direction, result: "voted" });
       const label = direction === "up" ? "Upvoted" : "Downvoted";
       return text(`${label} [${block_id.slice(0, 8)}]. Score: ${typeof score === "number" ? score.toFixed(1) : "updating"}`);
     },
@@ -532,6 +537,7 @@ function createMcpServer(userId: string) {
     },
     async ({ domain, action_key }) => {
       const chains = await db.status(domain, action_key);
+      trackTool(userId, "hive_status", { domain, action_key, block_count: chains.length });
       if (!chains.length) return text(`No Hive knowledge for ${domain} yet.`);
       const formatted = chains
         .map((c) => {
