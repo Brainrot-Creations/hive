@@ -372,15 +372,28 @@ app.get("/oauth/callback", authLimit, async (req, res) => {
 
 // ─── MCP auth bridge (website → here → Claude Code) ──────────────────────────
 
-app.options("/mcp-auth-bridge", (_req, res) => {
-  res.header("Access-Control-Allow-Origin", WEBSITE_BASE_URL);
+const ALLOWED_ORIGINS = [
+  WEBSITE_BASE_URL,
+  WEBSITE_BASE_URL.replace("://", "://www."),   // allow www variant
+  WEBSITE_BASE_URL.replace("://www.", "://"),    // allow non-www variant
+].filter((v, i, a) => a.indexOf(v) === i);      // dedupe
+
+function setCorsHeaders(req: express.Request, res: express.Response) {
+  const origin = req.headers.origin ?? "";
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
+}
+
+app.options("/mcp-auth-bridge", (req, res) => {
+  setCorsHeaders(req, res);
   res.header("Access-Control-Allow-Headers", "Content-Type");
   res.header("Access-Control-Allow-Methods", "POST");
   res.sendStatus(200);
 });
 
 app.post("/mcp-auth-bridge", authLimit, async (req, res) => {
-  res.header("Access-Control-Allow-Origin", WEBSITE_BASE_URL);
+  setCorsHeaders(req, res);
 
   const { mcp_state, access_token, refresh_token } = req.body as Record<string, string>;
   if (!mcp_state || !access_token || !refresh_token) {
