@@ -441,6 +441,8 @@ app.use(
 function createMcpServer(userId: string) {
   const server = new McpServer({ name: "hive", version: "0.1.0" });
 
+  // ── hive_register ──────────────────────────────────────────────────────────
+
   server.registerTool(
     "hive_register",
     {
@@ -455,11 +457,116 @@ function createMcpServer(userId: string) {
     },
   );
 
+  // ── hive_search ────────────────────────────────────────────────────────────
+  // Entry point for any domain. Call this first to discover what the
+  // collective already knows — workflows and atomic action keys.
+
+  server.registerTool(
+    "hive_search",
+    {
+      description:
+        "Discover what the Hive collective knows about a domain. Call this FIRST before acting on any website — it shows available workflows (multi-step procedures) and known action keys (atomic selectors). Use the results to decide whether to pull a full workflow or individual blocks.",
+      inputSchema: {
+        domain: z.string().describe('e.g. "linkedin.com"'),
+        query:  z.string().optional().describe('Optional filter — e.g. "connect", "reply", "submit"'),
+      },
+    },
+    async ({ domain, query }) => {
+      const result = await db.searchKnowledge(domain, query);
+      trackTool(userId, "hive_search", { domain, query, workflow_count: result.workflows.length, action_count: result.action_keys.length });
+
+      if (!result.workflows.length && !result.action_keys.length) {
+        return text(
+          `Hive has no knowledge for ${domain}${query ? ` matching "${query}"` : ""} yet.\n` +
+          `Be the first — use your browser tools, then contribute what you discover.`,
+        );
+      }
+
+      const lines: string[] = [`Hive knowledge for ${domain}${query ? ` (query: "${query}")` : ""}:\n`];
+
+      if (result.workflows.length) {
+        lines.push("WORKFLOWS (multi-step procedures):");
+        for (const wf of result.workflows) {
+          const score    = typeof wf.score === "number" ? wf.score.toFixed(1) : "0";
+          const verified = wf.last_verified_at
+            ? new Date(wf.last_verified_at).toLocaleDateString()
+            : "unverified";
+          lines.push(
+            `  ${wf.workflow_key}  [${wf.step_count} steps, score=${score}, verified=${verified}]\n` +
+            `    "${wf.description}"\n` +
+            `    → call hive_pull_workflow to get the full sequence`,
+          );
+        }
+        lines.push("");
+      }
+
+      if (result.action_keys.length) {
+        lines.push("ATOMIC ACTIONS (individual selectors):");
+        lines.push(`  ${result.action_keys.join(", ")}`);
+        lines.push(`  → call hive_pull with an action_key to get ranked selectors`);
+      }
+
+      return text(lines.join("\n"));
+    },
+  );
+
+  // ── hive_pull_workflow ─────────────────────────────────────────────────────
+  // Retrieve a complete ordered procedure from the collective memory.
+
+  server.registerTool(
+    "hive_pull_workflow",
+    {
+      description:
+        "Get a complete multi-step workflow from Hive. Returns ordered steps, each with a method (css/xpath/aria/visual) to execute. Call hive_search first to discover available workflow keys. After executing, call hive_vote_workflow to signal whether it worked.",
+      inputSchema: {
+        domain:       z.string().describe('e.g. "linkedin.com"'),
+        workflow_key: z.string().describe('Workflow slug from hive_search, e.g. "send_connection_with_note"'),
+      },
+    },
+    async ({ domain, workflow_key }) => {
+      const wf = await db.pullWorkflow(domain, workflow_key);
+      trackTool(userId, "hive_pull_workflow", { domain, workflow_key, result: wf ? "found" : "not_found" });
+
+      if (!wf) {
+        return text(
+          `No workflow "${workflow_key}" found for ${domain}.\n` +
+          `Call hive_search to see what's available, or hive_contribute_workflow to add it.`,
+        );
+      }
+
+      const score    = typeof wf.score === "number" ? wf.score.toFixed(1) : "0";
+      const verified = wf.last_verified_at
+        ? new Date(wf.last_verified_at).toLocaleDateString()
+        : "unverified";
+
+      const steps = wf.steps
+        .map((s) =>
+          `  Step ${s.step_index + 1}: ${s.action_name}\n` +
+          `    type:  ${s.method.type}\n` +
+          `    value: ${s.method.value}\n` +
+          (s.method.context ? `    ctx:   ${s.method.context}\n` : "") +
+          (s.notes ? `    note:  ${s.notes}\n` : ""),
+        )
+        .join("\n");
+
+      return text(
+        `Workflow: ${wf.workflow_key}  [id:${wf.id.slice(0, 8)}, score=${score}, verified=${verified}]\n` +
+        `Goal: ${wf.description}\n` +
+        `Contributors: ${wf.contributor_count}  Steps: ${wf.steps.length}\n\n` +
+        `${steps}\n` +
+        `After executing, call hive_vote_workflow with id:${wf.id.slice(0, 8)} to signal success or failure.`,
+      );
+    },
+  );
+
+  // ── hive_pull ──────────────────────────────────────────────────────────────
+  // Atomic selector lookup. Hints about workflows if relevant ones exist.
+
   server.registerTool(
     "hive_pull",
     {
       description:
-        "Check Hive for known methods to perform an action on a website. Call BEFORE using browser tools. Returns blocks ranked by collective confidence — try them top-down.",
+        "Get ranked selectors for a single atomic action on a website. Call BEFORE using browser tools for individual interactions. Returns blocks ranked by collective confidence — try top-down, vote after each attempt. For multi-step goals, call hive_search first.",
       inputSchema: {
         domain:     z.string().describe('e.g. "reddit.com"'),
         action_key: z.string().describe('e.g. "click_reply"'),
@@ -467,14 +574,36 @@ function createMcpServer(userId: string) {
       },
     },
     async ({ domain, action_key, limit }) => {
-      const blocks = await db.pullChain(domain, action_key, limit ?? 5);
+      const [blocks, search] = await Promise.all([
+        db.pullChain(domain, action_key, limit ?? 5),
+        db.searchKnowledge(domain, action_key),
+      ]);
+
       trackTool(userId, "hive_pull", { domain, action_key, block_count: blocks.length, result: blocks.length ? "found" : "empty" });
-      if (!blocks.length) {
-        return text(
-          `No known methods for "${action_key}" on ${domain}.\n` +
-          `Use your browser tool, then call hive_contribute with what works.`,
+
+      const lines: string[] = [];
+
+      // Hint if any workflow contains this action as a step
+      const relevantWorkflows = search.workflows.filter((wf) =>
+        wf.workflow_key.toLowerCase().includes(action_key.toLowerCase().replace(/_/g, "")) ||
+        wf.description.toLowerCase().includes(action_key.toLowerCase().replace(/_/g, " "))
+      );
+      if (relevantWorkflows.length) {
+        lines.push(
+          `Tip: Hive has ${relevantWorkflows.length} workflow(s) for ${domain} that may cover this action:`,
+          ...relevantWorkflows.map((wf) => `  hive_pull_workflow("${domain}", "${wf.workflow_key}") — ${wf.description}`),
+          "",
         );
       }
+
+      if (!blocks.length) {
+        lines.push(
+          `No known selectors for "${action_key}" on ${domain}.`,
+          `Use your browser tool, then call hive_contribute with what works.`,
+        );
+        return text(lines.join("\n"));
+      }
+
       const formatted = blocks
         .map((b, i) => {
           const score   = typeof b.score === "number" ? b.score.toFixed(1) : "0";
@@ -488,15 +617,68 @@ function createMcpServer(userId: string) {
           );
         })
         .join("\n\n");
-      return text(`${blocks.length} known method(s) for "${action_key}" on ${domain}:\n\n${formatted}`);
+
+      lines.push(`${blocks.length} known selector(s) for "${action_key}" on ${domain}:\n\n${formatted}`);
+      return text(lines.join("\n"));
     },
   );
+
+  // ── hive_contribute_workflow ───────────────────────────────────────────────
+  // Share a complete multi-step procedure with the collective.
+
+  server.registerTool(
+    "hive_contribute_workflow",
+    {
+      description:
+        "Contribute a complete multi-step workflow to Hive. Call after successfully completing a multi-action goal that required discovering the sequence yourself. Other agents will use this to skip the discovery phase entirely.",
+      inputSchema: {
+        domain:       z.string().describe('e.g. "linkedin.com"'),
+        workflow_key: z.string().describe('Snake-case slug for this procedure, e.g. "send_connection_with_note"'),
+        description:  z.string().describe('What this workflow accomplishes, e.g. "Send a LinkedIn connection request with a personalized note"'),
+        steps: z.array(
+          z.object({
+            action_name: z.string().describe('What this step does, e.g. "click_invite_to_connect"'),
+            method: z.object({
+              type:    z.enum(["css", "xpath", "aria", "visual"]),
+              value:   z.string(),
+              context: z.string().optional(),
+            }),
+            notes: z.string().optional().describe("Agent hint for this step, e.g. \"Only visible on /in/ profile pages\""),
+          }),
+        ).describe("Ordered steps — array position determines execution order"),
+      },
+    },
+    async ({ domain, workflow_key, description, steps }) => {
+      const installId = await ensureAgent(userId);
+      const id = workflowId(domain, workflow_key);
+      const stepsWithIndex = steps.map((s, i) => ({ step_index: i, ...s }));
+
+      const { isNew } = await db.contributeWorkflow({
+        id, domain, workflow_key, description,
+        steps: stepsWithIndex,
+        install_id: installId,
+      });
+
+      trackTool(userId, "hive_contribute_workflow", {
+        domain, workflow_key, step_count: steps.length,
+        result: isNew ? "contributed" : "already_exists",
+      });
+
+      return text(
+        isNew
+          ? `Contributed workflow "${workflow_key}" for ${domain} with ${steps.length} steps. [id:${id.slice(0, 8)}]\nThank you — every agent on ${domain} now benefits from your discovery.`
+          : `Workflow "${workflow_key}" already exists. You've been credited as a contributor.\nVote on it instead to signal it still works: hive_vote_workflow`,
+      );
+    },
+  );
+
+  // ── hive_contribute ────────────────────────────────────────────────────────
 
   server.registerTool(
     "hive_contribute",
     {
       description:
-        "Contribute a discovered browser method to Hive. Call after successfully performing an action NOT in hive_pull results.",
+        "Contribute a single selector/method to Hive. Call after successfully performing an atomic action NOT found in hive_pull results. For multi-step discoveries, use hive_contribute_workflow instead.",
       inputSchema: {
         domain:     z.string(),
         action_key: z.string(),
@@ -521,6 +703,29 @@ function createMcpServer(userId: string) {
     },
   );
 
+  // ── hive_vote_workflow ─────────────────────────────────────────────────────
+
+  server.registerTool(
+    "hive_vote_workflow",
+    {
+      description:
+        'Vote on a workflow from hive_pull_workflow. "up" if the full sequence worked, "down" if it failed or is outdated. Always vote after executing a workflow.',
+      inputSchema: {
+        workflow_id: z.string().describe("Workflow ID from hive_pull_workflow output"),
+        direction:   z.enum(["up", "down"]),
+      },
+    },
+    async ({ workflow_id, direction }) => {
+      const installId = await ensureAgent(userId);
+      const score = await db.voteWorkflow(workflow_id, installId, direction);
+      trackTool(userId, "hive_vote_workflow", { direction, result: "voted" });
+      const label = direction === "up" ? "Upvoted" : "Downvoted";
+      return text(`${label} workflow [${workflow_id.slice(0, 8)}]. Score: ${typeof score === "number" ? score.toFixed(1) : "updating"}`);
+    },
+  );
+
+  // ── hive_vote ──────────────────────────────────────────────────────────────
+
   server.registerTool(
     "hive_vote",
     {
@@ -539,29 +744,55 @@ function createMcpServer(userId: string) {
     },
   );
 
+  // ── hive_status ────────────────────────────────────────────────────────────
+
   server.registerTool(
     "hive_status",
     {
-      description: "See what Hive knows about a domain.",
+      description: "See a full coverage report of what Hive knows about a domain — workflows, action keys, scores, and verification dates.",
       inputSchema: {
         domain:     z.string(),
         action_key: z.string().optional(),
       },
     },
     async ({ domain, action_key }) => {
-      const chains = await db.status(domain, action_key);
-      trackTool(userId, "hive_status", { domain, action_key, block_count: chains.length });
-      if (!chains.length) return text(`No Hive knowledge for ${domain} yet.`);
-      const formatted = chains
-        .map((c) => {
+      const [chains, search] = await Promise.all([
+        db.status(domain, action_key),
+        db.searchKnowledge(domain),
+      ]);
+      trackTool(userId, "hive_status", { domain, action_key, block_count: chains.length, workflow_count: search.workflows.length });
+
+      if (!chains.length && !search.workflows.length) {
+        return text(`No Hive knowledge for ${domain} yet.`);
+      }
+
+      const lines: string[] = [`Hive coverage for ${domain}:\n`];
+
+      if (search.workflows.length) {
+        lines.push(`WORKFLOWS (${search.workflows.length}):`);
+        for (const wf of search.workflows) {
+          const score    = typeof wf.score === "number" ? wf.score.toFixed(1) : "?";
+          const verified = wf.last_verified_at
+            ? new Date(wf.last_verified_at).toLocaleDateString()
+            : "never";
+          lines.push(`  ${wf.workflow_key}  steps=${wf.step_count}  score=${score}  verified=${verified}`);
+          lines.push(`    ${wf.description}`);
+        }
+        lines.push("");
+      }
+
+      if (chains.length) {
+        lines.push(`ATOMIC ACTIONS (${chains.length}):`);
+        for (const c of chains) {
           const score    = typeof c.score === "number" ? (c.score as number).toFixed(1) : "?";
           const verified = c.last_upvoted_at
             ? new Date(c.last_upvoted_at as string).toLocaleDateString()
             : "never";
-          return `  ${c.action_key}  score=${score}  last_verified=${verified}`;
-        })
-        .join("\n");
-      return text(`Hive coverage for ${domain}:\n\n${formatted}`);
+          lines.push(`  ${c.action_key}  score=${score}  last_verified=${verified}`);
+        }
+      }
+
+      return text(lines.join("\n"));
     },
   );
 
@@ -609,6 +840,12 @@ async function requireAuth(
 function blockId(domain: string, actionKey: string, method: object): string {
   return createHash("sha256")
     .update(domain + actionKey + JSON.stringify(method))
+    .digest("hex");
+}
+
+function workflowId(domain: string, workflowKey: string): string {
+  return createHash("sha256")
+    .update(domain + "|" + workflowKey)
     .digest("hex");
 }
 

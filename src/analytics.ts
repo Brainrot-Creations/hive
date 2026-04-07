@@ -26,9 +26,14 @@ function anonymize(userId: string): string {
 interface ToolProperties {
   domain?: string;
   action_key?: string;
+  workflow_key?: string;
+  query?: string;
   direction?: string;
-  result?: string;  // "found" | "empty" | "contributed" | "already_exists" | "voted"
+  result?: string;
   block_count?: number;
+  workflow_count?: number;
+  action_count?: number;
+  step_count?: number;
   duration_ms?: number;
 }
 
